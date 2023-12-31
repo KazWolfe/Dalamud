@@ -89,6 +89,8 @@ internal partial class PluginManager : IDisposable, IServiceType
     [ServiceManager.ServiceDependency]
     private readonly ChatGui chatGui = Service<ChatGui>.Get();
 
+    private readonly object autoUpdateLock = new();
+
     static PluginManager()
     {
         DalamudApiLevel = typeof(PluginManager).Assembly.GetName().Version!.Major;
@@ -253,6 +255,11 @@ internal partial class PluginManager : IDisposable, IServiceType
     /// Gets or sets a value indicating whether banned plugins will be loaded.
     /// </summary>
     public bool LoadBannedPlugins { get; set; }
+    
+    /// <summary>
+    /// Gets a list representing the auto-update attempt results.
+    /// </summary>
+    internal List<PluginUpdateStatus>? SessionAutoUpdateResults { get; private set; }
 
     /// <summary>
     /// Gets a value indicating whether the given repo manifest should be visible to the user.
@@ -662,7 +669,7 @@ internal partial class PluginManager : IDisposable, IServiceType
 
                 var sigScanner = await Service<TargetSigScanner>.GetAsync().ConfigureAwait(false);
                 this.PluginsReady = true;
-                this.NotifyinstalledPluginsListChanged();
+                this.NotifyInstalledPluginsListChanged();
                 sigScanner.Save();
             },
             tokenSource.Token);
@@ -791,7 +798,7 @@ internal partial class PluginManager : IDisposable, IServiceType
         }
 
         if (listChanged)
-            this.NotifyinstalledPluginsListChanged();
+            this.NotifyInstalledPluginsListChanged();
     }
 
     /// <summary>
@@ -826,7 +833,7 @@ internal partial class PluginManager : IDisposable, IServiceType
 
         PluginLocations.Remove(plugin.AssemblyName?.FullName ?? string.Empty, out _);
 
-        this.NotifyinstalledPluginsListChanged();
+        this.NotifyInstalledPluginsListChanged();
         this.NotifyAvailablePluginsChanged();
     }
 
@@ -953,7 +960,7 @@ internal partial class PluginManager : IDisposable, IServiceType
 
         var updatedList = await Task.WhenAll(updateTasks);
 
-        this.NotifyinstalledPluginsListChanged();
+        this.NotifyInstalledPluginsListChanged();
         this.NotifyPluginsForStateChange(
             autoUpdate ? PluginListInvalidationKind.AutoUpdate : PluginListInvalidationKind.Update,
             updatedList.Select(x => x.InternalName));
@@ -1061,7 +1068,7 @@ internal partial class PluginManager : IDisposable, IServiceType
         }
 
         if (notify && updateStatus.Status == PluginUpdateStatus.StatusKind.Success)
-            this.NotifyinstalledPluginsListChanged();
+            this.NotifyInstalledPluginsListChanged();
 
         return updateStatus;
     }
@@ -1415,7 +1422,7 @@ internal partial class PluginManager : IDisposable, IServiceType
 
         var plugin = await this.LoadPluginAsync(dllFile, manifest, reason);
 
-        this.NotifyinstalledPluginsListChanged();
+        this.NotifyInstalledPluginsListChanged();
         return plugin;
     }
     
@@ -1621,17 +1628,48 @@ internal partial class PluginManager : IDisposable, IServiceType
         Log.Debug("Update check found {updateCount} available updates.", this.updatablePluginsList.Count);
     }
 
+    private void PerformAutoUpdate()
+    {
+        lock (this.autoUpdateLock)
+        {
+            if (this.SessionAutoUpdateResults != null)
+            {
+                Log.Verbose("Skipping auto-update attempt as one was already run this session.");
+                return;
+            }
+        
+            Log.Debug("Starting plugin auto-update process...");
+            
+            Task.Run(() => this.UpdatePluginsAsync(true, !this.configuration.AutoUpdatePlugins, true)).ContinueWith(task =>
+            {
+                if (task.IsFaulted)
+                {
+                    Log.Error(task.Exception, Loc.Localize("DalamudPluginUpdateCheckFail", "Could not check for plugin updates."));
+                    return;
+                }
+
+                this.SessionAutoUpdateResults = task.Result.ToList();
+            });
+        }
+    }
+
     private void NotifyAvailablePluginsChanged()
     { 
         this.DetectAvailablePluginUpdates();
 
+        Log.Verbose("Firing event: OnAvailablePluginsChanged");
         this.OnAvailablePluginsChanged?.InvokeSafely();
     }
 
-    private void NotifyinstalledPluginsListChanged()
+    private void NotifyInstalledPluginsListChanged()
     {
         this.DetectAvailablePluginUpdates();
+        
+        // hack: this event is called after everything has loaded, so we're just going to piggyback off of it to
+        // perform auto-updates. 
+        this.PerformAutoUpdate();
 
+        Log.Verbose("Firing event: OnInstalledPluginsChanged");
         this.OnInstalledPluginsChanged?.InvokeSafely();
     }
 

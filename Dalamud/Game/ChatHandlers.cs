@@ -110,16 +110,20 @@ internal class ChatHandlers : IServiceType
 
     [ServiceManager.ServiceDependency]
     private readonly Dalamud dalamud = Service<Dalamud>.Get();
-    
+
     [ServiceManager.ServiceDependency]
     private readonly DalamudConfiguration configuration = Service<DalamudConfiguration>.Get();
 
+    private readonly ChatGui chatGui;
+
     private bool hasSeenLoadingMsg;
-    private bool startedAutoUpdatingPlugins;
+    private bool hasSeenPluginAutoUpdateNotice;
 
     [ServiceManager.ServiceConstructor]
     private ChatHandlers(ChatGui chatGui)
     {
+        this.chatGui = chatGui;
+
         chatGui.CheckMessageHandled += this.OnCheckMessageHandled;
         chatGui.ChatMessage += this.OnChatMessage;
 
@@ -175,12 +179,12 @@ internal class ChatHandlers : IServiceType
         {
             if (!this.hasSeenLoadingMsg)
                 this.PrintWelcomeMessage();
-            
+
             // FIXME (kazwolfe): This will only run on the first Notice received, meaning auto-updates won't happen
             // until the character is logged in. Ideally, this should move earlier into the process (after all repos
             // are loaded) with just the update summary posted here. 
-            if (!this.startedAutoUpdatingPlugins)
-                this.AutoUpdatePlugins();
+            if (!this.hasSeenPluginAutoUpdateNotice)
+                this.PrintAutoUpdateMessage();
         }
 
         if (type == XivChatType.Notice && !this.hasSeenLoadingMsg)
@@ -279,66 +283,54 @@ internal class ChatHandlers : IServiceType
         this.hasSeenLoadingMsg = true;
     }
 
-    private void AutoUpdatePlugins()
+    private void PrintAutoUpdateMessage()
     {
-        var chatGui = Service<ChatGui>.GetNullable();
         var pluginManager = Service<PluginManager>.GetNullable();
         var notifications = Service<NotificationManager>.GetNullable();
 
-        if (chatGui == null || pluginManager == null || notifications == null)
+        if (pluginManager == null)
         {
-            Log.Warning("Aborting auto-update because a required service was not loaded.");
+            Log.Error("Can't print plugin auto-update information because PluginManager is null!");
             return;
         }
 
-        if (!pluginManager.ReposReady || !pluginManager.InstalledPlugins.Any() || !pluginManager.AvailablePlugins.Any())
+        this.hasSeenPluginAutoUpdateNotice = true;
+
+        var updatedPlugins = pluginManager.SessionAutoUpdateResults;
+        if (updatedPlugins != null && updatedPlugins.Any())
         {
-            // Plugins aren't ready yet.
-            // TODO: We should retry. This sucks, because it means we won't ever get here again until another notice.
-            Log.Warning("Aborting auto-update because plugins weren't loaded or ready.");
-            return;
-        }
-
-        this.startedAutoUpdatingPlugins = true;
-
-        Log.Debug("Beginning plugin auto-update process...");
-        Task.Run(() => pluginManager.UpdatePluginsAsync(true, !this.configuration.AutoUpdatePlugins, true)).ContinueWith(task =>
-        {
-            this.IsAutoUpdateComplete = true;
-
-            if (task.IsFaulted)
+            if (this.configuration.AutoUpdatePlugins)
             {
-                Log.Error(task.Exception, Loc.Localize("DalamudPluginUpdateCheckFail", "Could not check for plugin updates."));
-                return;
+                pluginManager.PrintUpdatedPlugins(updatedPlugins, Loc.Localize("DalamudPluginAutoUpdate", "Auto-update:"));
+                notifications?.AddNotification(
+                    Loc.Localize("NotificationUpdatedPlugins", "{0} of your plugins were updated.")
+                       .Format(updatedPlugins.Count),
+                    Loc.Localize("NotificationAutoUpdate", "Auto-Update"),
+                    NotificationType.Info);
             }
-
-            var updatedPlugins = task.Result.ToList();
-            if (updatedPlugins.Any())
+            else
             {
-                if (this.configuration.AutoUpdatePlugins)
-                {
-                    Service<PluginManager>.Get().PrintUpdatedPlugins(updatedPlugins, Loc.Localize("DalamudPluginAutoUpdate", "Auto-update:"));
-                    notifications.AddNotification(Loc.Localize("NotificationUpdatedPlugins", "{0} of your plugins were updated.").Format(updatedPlugins.Count), Loc.Localize("NotificationAutoUpdate", "Auto-Update"), NotificationType.Info);
-                }
-                else
-                {
-                    chatGui.Print(new XivChatEntry
+                this.chatGui.Print(
+                    new XivChatEntry
                     {
-                        Message = new SeString(new List<Payload>()
-                        {
-                            new TextPayload(Loc.Localize("DalamudPluginUpdateRequired", "One or more of your plugins needs to be updated. Please use the /xlplugins command in-game to update them!")),
-                            new TextPayload("  ["),
-                            new UIForegroundPayload(500),
-                            this.openInstallerWindowLink,
-                            new TextPayload(Loc.Localize("DalamudInstallerHelp", "Open the plugin installer")),
-                            RawPayload.LinkTerminator,
-                            new UIForegroundPayload(0),
-                            new TextPayload("]"),
-                        }),
+                        Message = new SeString(
+                            new List<Payload>
+                            {
+                                new TextPayload(
+                                    Loc.Localize(
+                                        "DalamudPluginUpdateRequired",
+                                        "One or more of your plugins needs to be updated. Please use the /xlplugins command in-game to update them!")),
+                                new TextPayload("  ["),
+                                new UIForegroundPayload(500),
+                                this.openInstallerWindowLink,
+                                new TextPayload(Loc.Localize("DalamudInstallerHelp", "Open the plugin installer")),
+                                RawPayload.LinkTerminator,
+                                new UIForegroundPayload(0),
+                                new TextPayload("]"),
+                            }),
                         Type = XivChatType.Urgent,
                     });
-                }
             }
-        });
+        }
     }
 }
